@@ -1,0 +1,28 @@
+name: Release
+
+# Builds binaries when a version tag is pushed. It only attaches artifacts to
+# a draft release; publishing it stays a manual decision.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test before releasing
+        run: go test ./...
+      - name: Build binaries
+        run: scripts/build-release.sh "${GITHUB_REF_NAME#v}"
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*

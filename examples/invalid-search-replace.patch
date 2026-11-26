@@ -1,0 +1,9 @@
+### FILE: greeter.py
+
+<<<<<<< SEARCH
+def greet_everyone():
+    print("This function does not exist in greeter.py")
+=======
+def greet_everyone():
+    print("so this patch must be rejected")
+>>>>>>> REPLACE

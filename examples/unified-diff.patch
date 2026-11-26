@@ -1,0 +1,8 @@
+diff --git a/greeter.py b/greeter.py
+--- a/greeter.py
++++ b/greeter.py
+@@ -1,2 +1,3 @@
+ def greet():
+-    print("Hello")
++    print("Hello, World!")
++    print("Welcome!")

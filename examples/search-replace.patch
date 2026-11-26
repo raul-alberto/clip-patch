@@ -1,0 +1,13 @@
+Here is the change. The function now takes an optional name.
+
+### FILE: greeter.py
+
+<<<<<<< SEARCH
+def greet():
+    print("Hello")
+=======
+def greet(name="World"):
+    print(f"Hello, {name}!")
+>>>>>>> REPLACE
+
+This should keep the existing call at the bottom working.

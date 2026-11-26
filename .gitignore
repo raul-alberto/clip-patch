@@ -1,0 +1,21 @@
+# Build output
+/bin/
+/dist/
+/clip-patch
+/clip-patch.exe
+/cpatch
+/cpatch.exe
+
+# Go
+*.test
+*.out
+coverage.txt
+
+# Fuzzing corpora generated locally (checked-in seeds live in testdata/)
+# internal/**/testdata/fuzz/*/ is intentionally NOT ignored.
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
