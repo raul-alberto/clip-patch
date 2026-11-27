@@ -21,6 +21,26 @@ const (
 
 const rule = "----------------------------------------"
 
+type checkedWriter struct {
+	writer io.Writer
+	err    error
+}
+
+func (w *checkedWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+
+	n, err := w.writer.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.err = err
+	}
+	return n, err
+}
+
 func paint(on bool, code, s string) string {
 	if !on {
 		return s
@@ -29,7 +49,10 @@ func paint(on bool, code, s string) string {
 }
 
 // Render writes the preview for plan to w.
-func Render(w io.Writer, version string, plan *apply.Plan, color bool) {
+func Render(w io.Writer, version string, plan *apply.Plan, color bool) error {
+	checked := &checkedWriter{writer: w}
+	w = checked
+
 	changed := 0
 	edits := 0
 	for _, c := range plan.Changes {
@@ -70,6 +93,7 @@ func Render(w io.Writer, version string, plan *apply.Plan, color bool) {
 		io.WriteString(w, colorize(text, color))
 	}
 	fmt.Fprintf(w, "\n%s\n\nPreview complete.\n", rule)
+	return checked.err
 }
 
 func colorize(text string, color bool) string {

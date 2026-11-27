@@ -22,6 +22,7 @@ import (
 type Ops struct {
 	CreateTemp func(dir, pattern string) (*os.File, error)
 	Rename     func(oldpath, newpath string) error
+	RemoveAll  func(path string) error
 	NewID      func() string
 }
 
@@ -30,6 +31,7 @@ func DefaultOps() Ops {
 	return Ops{
 		CreateTemp: os.CreateTemp,
 		Rename:     os.Rename,
+		RemoveAll:  os.RemoveAll,
 		NewID:      newBackupID,
 	}
 }
@@ -104,12 +106,14 @@ type manifest struct {
 // createBackup stores the exact original bytes of every changed file under a
 // fresh directory, verifies each copy, and writes a manifest. It returns the
 // backup directory. It never overwrites an existing backup.
-func createBackup(plan *Plan, changes []*Change, backupRoot string, ops Ops) (string, error) {
+func createBackup(plan *Plan, changes []*Change, backupRoot string, ops Ops) (backupDir string, retErr error) {
 	if err := os.MkdirAll(backupRoot, 0o700); err != nil {
 		return "", fmt.Errorf("cannot create backup directory %q: %w", backupRoot, err)
 	}
+
 	session := ""
 	var lastErr error
+
 	for attempt := 0; attempt < 5; attempt++ {
 		cand := filepath.Join(backupRoot, ops.NewID())
 		err := os.Mkdir(cand, 0o700)
@@ -122,9 +126,30 @@ func createBackup(plan *Plan, changes []*Change, backupRoot string, ops Ops) (st
 			return "", fmt.Errorf("cannot create backup directory %q: %w", cand, err)
 		}
 	}
+
 	if session == "" {
 		return "", fmt.Errorf("could not allocate a unique backup directory under %q: %w", backupRoot, lastErr)
 	}
+
+	// Remove an incomplete backup if any subsequent operation fails.
+	cleanup := true
+	defer func() {
+		if !cleanup {
+			return
+		}
+
+		if err := ops.RemoveAll(session); err != nil {
+			backupDir = session
+			retErr = fmt.Errorf(
+				"%w; incomplete backup remains at %q because cleanup failed: %v",
+				retErr,
+				session,
+				err,
+			)
+		} else {
+			backupDir = ""
+		}
+	}()
 
 	m := manifest{
 		Tool:      "clip-patch",
@@ -132,11 +157,13 @@ func createBackup(plan *Plan, changes []*Change, backupRoot string, ops Ops) (st
 		Root:      plan.RootAbs,
 		Format:    string(plan.Format),
 	}
+
 	for _, c := range changes {
 		dst := filepath.Join(session, "files", filepath.FromSlash(c.File.Rel))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 			return "", fmt.Errorf("cannot create backup subdirectory for %s: %w", c.File.Rel, err)
 		}
+
 		out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return "", fmt.Errorf("cannot create backup of %s: %w", c.File.Rel, err)
@@ -152,6 +179,7 @@ func createBackup(plan *Plan, changes []*Change, backupRoot string, ops Ops) (st
 		if werr != nil {
 			return "", fmt.Errorf("cannot write backup of %s: %w", c.File.Rel, werr)
 		}
+
 		back, err := os.ReadFile(dst)
 		if err != nil {
 			return "", fmt.Errorf("cannot verify backup of %s: %w", c.File.Rel, err)
@@ -173,6 +201,7 @@ func createBackup(plan *Plan, changes []*Change, backupRoot string, ops Ops) (st
 	if err != nil {
 		return "", fmt.Errorf("cannot encode backup manifest: %w", err)
 	}
+
 	mf, err := os.OpenFile(filepath.Join(session, "manifest.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("cannot create backup manifest: %w", err)
@@ -185,6 +214,8 @@ func createBackup(plan *Plan, changes []*Change, backupRoot string, ops Ops) (st
 	if cerr != nil {
 		return "", fmt.Errorf("cannot write backup manifest: %w", cerr)
 	}
+
+	cleanup = false
 	return session, nil
 }
 
@@ -208,6 +239,9 @@ func Execute(plan *Plan, backupRoot string, ops Ops) (*Result, error) {
 	if ops.Rename == nil {
 		ops.Rename = def.Rename
 	}
+	if ops.RemoveAll == nil {
+		ops.RemoveAll = def.RemoveAll
+	}
 	if ops.NewID == nil {
 		ops.NewID = def.NewID
 	}
@@ -221,7 +255,10 @@ func Execute(plan *Plan, backupRoot string, ops Ops) (*Result, error) {
 	}
 	session, err := createBackup(plan, changes, backupRoot, ops)
 	if err != nil {
-		return nil, &ExecError{Err: err}
+		return nil, &ExecError{
+			Err:       err,
+			BackupDir: session,
+		}
 	}
 
 	var stagedFiles []staged
@@ -231,6 +268,13 @@ func Execute(plan *Plan, backupRoot string, ops Ops) (*Result, error) {
 		}
 	}
 	for _, c := range changes {
+		if err := plan.verifyChange(c); err != nil {
+			removeTemps()
+			return nil, &ExecError{
+				Err:       err,
+				BackupDir: session,
+			}
+		}
 		tf, err := ops.CreateTemp(filepath.Dir(c.File.Abs), ".clip-patch-*.tmp")
 		if err != nil {
 			removeTemps()
@@ -257,9 +301,20 @@ func Execute(plan *Plan, backupRoot string, ops Ops) (*Result, error) {
 
 	var done []staged
 	for _, s := range stagedFiles {
+		if err := plan.verifyChange(s.c); err != nil {
+			removeTemps()
+			rbErr := rollback(plan, done, ops)
+			return nil, rollbackResult(
+				fmt.Errorf("target %s changed before replacement: %w", s.c.File.Rel, err),
+				done,
+				rbErr,
+				session,
+			)
+		}
+
 		if err := ops.Rename(s.tmp, s.c.File.Abs); err != nil {
 			removeTemps()
-			rbErr := rollback(done)
+			rbErr := rollback(plan, done, ops)
 			return nil, rollbackResult(fmt.Errorf("cannot replace %s: %w", s.c.File.Rel, err), done, rbErr, session)
 		}
 		done = append(done, s)
@@ -267,14 +322,21 @@ func Execute(plan *Plan, backupRoot string, ops Ops) (*Result, error) {
 
 	// Post-write verification.
 	for _, s := range done {
-		got, err := os.ReadFile(s.c.File.Abs)
-		if err != nil || !bytes.Equal(got, s.c.NewBytes) {
-			rbErr := rollback(done)
+		current, err := safefs.Load(plan.RootAbs, plan.RootReal, s.c.File.Rel)
+		if err != nil || !bytes.Equal(current.Raw, s.c.NewBytes) {
+			rbErr := rollback(plan, done, ops)
+
 			reason := "the written content does not match the expected content"
 			if err != nil {
 				reason = err.Error()
 			}
-			return nil, rollbackResult(fmt.Errorf("verification of %s failed after writing: %s", s.c.File.Rel, reason), done, rbErr, session)
+
+			return nil, rollbackResult(
+				fmt.Errorf("verification of %s failed after writing: %s", s.c.File.Rel, reason),
+				done,
+				rbErr,
+				session,
+			)
 		}
 	}
 
@@ -298,26 +360,43 @@ func rollbackResult(cause error, done []staged, rbErr error, session string) err
 }
 
 // rollback restores the original bytes of every file in done, newest first.
-func rollback(done []staged) error {
+func rollback(plan *Plan, done []staged, ops Ops) error {
 	var msgs []string
+
 	for i := len(done) - 1; i >= 0; i-- {
 		c := done[i].c
-		if err := restore(c); err != nil {
+
+		if err := restore(plan, c, ops); err != nil {
 			msgs = append(msgs, fmt.Sprintf("%s: %v", c.File.Rel, err))
 		}
 	}
+
 	if len(msgs) > 0 {
 		return errors.New(strings.Join(msgs, "; "))
 	}
+
 	return nil
 }
 
-func restore(c *Change) error {
-	tf, err := os.CreateTemp(filepath.Dir(c.File.Abs), ".clip-patch-restore-*.tmp")
+// restore safely restores the original bytes if the target still contains
+// the content written by this execution.
+func restore(plan *Plan, c *Change, ops Ops) error {
+	current, err := safefs.Load(plan.RootAbs, plan.RootReal, c.File.Rel)
+	if err != nil {
+		return fmt.Errorf("cannot safely access target: %w", err)
+	}
+
+	if !bytes.Equal(current.Raw, c.NewBytes) {
+		return errors.New("target no longer contains the content written by clip-patch; refusing to overwrite it")
+	}
+
+	tf, err := ops.CreateTemp(filepath.Dir(c.File.Abs), ".clip-patch-restore-*.tmp")
 	if err != nil {
 		return err
 	}
+
 	tmp := tf.Name()
+
 	_, werr := tf.Write(c.File.Raw)
 	if werr == nil {
 		werr = tf.Sync()
@@ -329,11 +408,28 @@ func restore(c *Change) error {
 	if werr == nil {
 		werr = os.Chmod(tmp, c.File.Mode.Perm())
 	}
-	if werr == nil {
-		werr = os.Rename(tmp, c.File.Abs)
-	}
+
 	if werr != nil {
 		_ = os.Remove(tmp)
+		return werr
 	}
-	return werr
+
+	// Revalidate the target immediately before replacement.
+	current, err = safefs.Load(plan.RootAbs, plan.RootReal, c.File.Rel)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("target became unsafe before restoration: %w", err)
+	}
+
+	if !bytes.Equal(current.Raw, c.NewBytes) {
+		_ = os.Remove(tmp)
+		return errors.New("target changed before restoration; refusing to overwrite it")
+	}
+
+	if err := ops.Rename(tmp, c.File.Abs); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"clip-patch/internal/apply"
 	"clip-patch/internal/clipboard"
@@ -28,6 +29,8 @@ const (
 
 // MaxInputSize is the largest patch text accepted (clipboard or stdin).
 const MaxInputSize = 8 << 20
+
+const maxConfirmationBytes = 16
 
 // Env holds everything Run needs from the outside world, so tests can
 // replace it.
@@ -171,6 +174,10 @@ func Run(args []string, env Env) int {
 			printError(errw, fmt.Errorf("the patch on standard input is larger than %d MiB", MaxInputSize>>20), noteNoFiles)
 			return ExitError
 		}
+		if !utf8.Valid(data) {
+			printError(errw, errors.New("the patch on standard input is not valid UTF-8"), noteNoFiles)
+			return ExitError
+		}
 		input = string(data)
 	} else {
 		if env.Clipboard == nil {
@@ -221,7 +228,10 @@ func Run(args []string, env Env) int {
 	}
 
 	// 4. Preview.
-	preview.Render(out, env.Version, plan, color)
+	if err := preview.Render(out, env.Version, plan, color); err != nil {
+		printError(errw, fmt.Errorf("cannot write preview: %w", err), noteNoFiles)
+		return ExitError
+	}
 
 	if len(plan.ChangedFiles()) == 0 {
 		fmt.Fprintln(out, "\nThe patch is valid but produces no changes. Nothing to do.")
@@ -298,13 +308,22 @@ func confirm(env Env, out io.Writer) (bool, error) {
 		return false, err
 	}
 	defer rc.Close()
-	fmt.Fprint(out, "\nApply these changes? [y/N] ")
-	line, err := bufio.NewReader(rc).ReadString('\n')
-	if err != nil && line == "" {
-		// EOF or read error without an answer: treat as "no".
+	if _, err := fmt.Fprint(out, "\nApply these changes? [y/N] "); err != nil {
+		return false, fmt.Errorf("write confirmation prompt: %w", err)
+	}
+
+	line, err := bufio.NewReaderSize(rc, maxConfirmationBytes).ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) {
+		return false, fmt.Errorf("confirmation response exceeds %d bytes", maxConfirmationBytes)
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, fmt.Errorf("read confirmation: %w", err)
+	}
+	if err != nil && len(line) == 0 {
+		// EOF without an answer: treat as "no".
 		return false, nil
 	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
+	switch strings.ToLower(strings.TrimSpace(string(line))) {
 	case "y", "yes":
 		return true, nil
 	}

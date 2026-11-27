@@ -5,7 +5,6 @@ package apply
 import (
 	"bytes"
 	"fmt"
-	"os"
 
 	"clip-patch/internal/patch"
 	"clip-patch/internal/safefs"
@@ -25,9 +24,10 @@ func (c *Change) Changed() bool { return !bytes.Equal(c.File.Raw, c.NewBytes) }
 
 // Plan is a fully validated patch, computed entirely in memory.
 type Plan struct {
-	Format  patch.Format
-	RootAbs string
-	Changes []*Change
+	Format   patch.Format
+	RootAbs  string
+	RootReal string
+	Changes  []*Change
 }
 
 // ChangedFiles returns only the changes that alter file content.
@@ -49,7 +49,11 @@ func BuildPlan(root string, p *patch.Patch) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	plan := &Plan{Format: p.Format, RootAbs: rootAbs}
+	plan := &Plan{
+		Format:   p.Format,
+		RootAbs:  rootAbs,
+		RootReal: rootReal,
+	}
 	seen := map[string]string{}
 
 	for _, fp := range p.Files {
@@ -98,25 +102,35 @@ func BuildPlan(root string, p *patch.Patch) (*Plan, error) {
 	return plan, nil
 }
 
-// VerifyUnchanged re-reads every target and checks that its content still
-// matches the fingerprint taken when the plan was built.
-func (p *Plan) VerifyUnchanged() error {
-	for _, c := range p.Changes {
-		cur, err := os.ReadFile(c.File.Abs)
-		if err != nil {
-			return &patch.Error{
-				Title:  "File changed since the preview.",
-				File:   c.File.Rel,
-				Reason: "the file can no longer be read: " + err.Error(),
-			}
-		}
-		if safefs.Fingerprint(cur) != c.File.Hash {
-			return &patch.Error{
-				Title:  "File changed since the preview.",
-				File:   c.File.Rel,
-				Reason: "its content differs from when the preview was generated. Run clip-patch again to create a fresh preview.",
-			}
+// verifyChange revalidates a target path and checks its original fingerprint.
+func (p *Plan) verifyChange(c *Change) error {
+	current, err := safefs.Load(p.RootAbs, p.RootReal, c.File.Rel)
+	if err != nil {
+		return &patch.Error{
+			Title:  "File changed since the preview.",
+			File:   c.File.Rel,
+			Reason: "the file path is no longer safe or the file can no longer be loaded: " + err.Error(),
 		}
 	}
+
+	if current.Hash != c.File.Hash {
+		return &patch.Error{
+			Title:  "File changed since the preview.",
+			File:   c.File.Rel,
+			Reason: "its content differs from when the preview was generated. Run clip-patch again to create a fresh preview.",
+		}
+	}
+
+	return nil
+}
+
+// VerifyUnchanged revalidates every target and checks its original fingerprint.
+func (p *Plan) VerifyUnchanged() error {
+	for _, c := range p.Changes {
+		if err := p.verifyChange(c); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }

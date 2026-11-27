@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -150,6 +151,86 @@ func TestSearchReplaceErrors(t *testing.T) {
 	}
 }
 
+func TestSearchReplaceRejectsEmptyFilePath(t *testing.T) {
+	tests := []string{
+		"### FILE:",
+		"### FILE:   ",
+		"### FILE: ``",
+		"### FILE: \"\"",
+	}
+
+	for _, header := range tests {
+		t.Run(header, func(t *testing.T) {
+			in := join(
+				header,
+				"<<<<<<< SEARCH",
+				"old",
+				"=======",
+				"new",
+				">>>>>>> REPLACE",
+			)
+
+			expectErr(t, in, patch.FormatSearchReplace, "path")
+		})
+	}
+}
+
+func TestSearchReplaceRejectsEmptyFileHeaderBeforeValidHeader(t *testing.T) {
+	in := join(
+		"### FILE:",
+		"### FILE: valid.txt",
+		"<<<<<<< SEARCH",
+		"old",
+		"=======",
+		"new",
+		">>>>>>> REPLACE",
+	)
+
+	expectErr(t, in, patch.FormatSearchReplace, "path")
+}
+
+func TestSearchReplaceIgnoresUnsupportedFileHeaderStyles(t *testing.T) {
+	tests := []string{
+		"FILE: fake.txt",
+		"## FILE: fake.txt",
+		"###### FILE: fake.txt",
+	}
+
+	for _, header := range tests {
+		t.Run(header, func(t *testing.T) {
+			in := join(
+				header,
+				"<<<<<<< SEARCH",
+				"old",
+				"=======",
+				"new",
+				">>>>>>> REPLACE",
+			)
+
+			expectErr(t, in, patch.FormatSearchReplace, "before any")
+		})
+	}
+}
+
+func TestSearchReplaceNormalizesDuplicatePaths(t *testing.T) {
+	in := join(
+		"### FILE: a\\b.txt",
+		"<<<<<<< SEARCH", "one", "=======", "1", ">>>>>>> REPLACE",
+		"### FILE: a/b.txt",
+		"<<<<<<< SEARCH", "two", "=======", "2", ">>>>>>> REPLACE",
+	)
+
+	p := mustParse(t, in, patch.FormatSearchReplace)
+
+	if len(p.Files) != 1 {
+		t.Fatalf("want 1 file after path normalization, got %d", len(p.Files))
+	}
+
+	if len(p.Files[0].Edits) != 2 {
+		t.Fatalf("want 2 edits, got %d", len(p.Files[0].Edits))
+	}
+}
+
 // ---------------- Unified diff ----------------
 
 const simpleDiff = `diff --git a/src/main.py b/src/main.py
@@ -237,6 +318,8 @@ func TestUnifiedDiffErrors(t *testing.T) {
 	tests := []struct {
 		name, in, want string
 	}{
+		{"mixed prefixes old a", "--- a/file.txt\n+++ file.txt\n@@ -1 +1 @@\n-old\n+new\n", "inconsistent"},
+		{"mixed prefixes new b", "--- file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n", "inconsistent"},
 		{"malformed hunk header", "--- a/f\n+++ b/f\n@@ -x +y @@\n a\n", "malformed hunk header"},
 		{"truncated hunk", "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n", "truncated"},
 		{"truncated headers", "diff --git a/f b/f\nindex 1..2 100644\n", "expected '--- '"},
@@ -262,6 +345,92 @@ func TestUnifiedDiffErrors(t *testing.T) {
 	}
 }
 
+func TestUnifiedDiffPathsWithSpaces(t *testing.T) {
+	in := "--- \"a/my file.txt\"\n+++ \"b/my file.txt\"\n@@ -1 +1 @@\n-old\n+new\n"
+
+	p := mustParse(t, in, patch.FormatUnifiedDiff)
+
+	if len(p.Files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(p.Files))
+	}
+
+	if got := p.Files[0].Path; got != "my file.txt" {
+		t.Errorf("path = %q, want %q", got, "my file.txt")
+	}
+}
+
+func TestUnifiedDiffEscapedQuotedPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{
+			name: "escaped quote",
+			path: `my\"file.txt`,
+			want: `my"file.txt`,
+		},
+		{
+			name: "escaped backslash",
+			path: `my\\file.txt`,
+			want: `my\file.txt`,
+		},
+		{
+			name: "tab escape",
+			path: `my\tfile.txt`,
+			want: "my\tfile.txt",
+		},
+		{
+			name: "octal escape",
+			path: `my\101.txt`,
+			want: "myA.txt",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			in := "--- \"a/" + tc.path + "\"\n" +
+				"+++ \"b/" + tc.path + "\"\n" +
+				"@@ -1 +1 @@\n" +
+				"-old\n" +
+				"+new\n"
+
+			p := mustParse(t, in, patch.FormatUnifiedDiff)
+
+			if got := p.Files[0].Path; got != tc.want {
+				t.Fatalf("path = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUnifiedDiffRejectsMalformedQuotedPath(t *testing.T) {
+	tests := []string{
+		"--- \"a/my\\q.txt\"\n+++ \"b/my\\q.txt\"\n@@ -1 +1 @@\n-old\n+new\n",
+		"--- \"a/my\\x41.txt\"\n+++ \"b/my\\x41.txt\"\n@@ -1 +1 @@\n-old\n+new\n",
+		"--- \"a/my\\u0041.txt\"\n+++ \"b/my\\u0041.txt\"\n@@ -1 +1 @@\n-old\n+new\n",
+		"--- \"a/my\\z.txt\"\n+++ \"b/my\\z.txt\"\n@@ -1 +1 @@\n-old\n+new\n",
+		"--- \"a/my\\12.txt\"\n+++ \"b/my\\12.txt\"\n@@ -1 +1 @@\n-old\n+new\n",
+	}
+
+	for _, in := range tests {
+		expectErr(t, in, patch.FormatUnifiedDiff, "path")
+	}
+}
+
+func TestUnifiedDiffRejectsUnmatchedQuotedPath(t *testing.T) {
+	tests := []string{
+		"--- \"a/file.txt\n+++ \"b/file.txt\n@@ -1 +1 @@\n-old\n+new\n",
+		"--- a/file\"name.txt\n+++ b/file\"name.txt\n@@ -1 +1 @@\n-old\n+new\n",
+	}
+
+	for i, in := range tests {
+		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
+			expectErr(t, in, patch.FormatUnifiedDiff, "path")
+		})
+	}
+}
+
 // ---------------- Detection ----------------
 
 func TestAutoDetectAmbiguous(t *testing.T) {
@@ -275,6 +444,27 @@ func TestAutoDetectAmbiguous(t *testing.T) {
 func TestNoPatchFound(t *testing.T) {
 	expectErr(t, "just some prose, nothing to apply\n", patch.FormatAuto, "No supported patch found")
 	expectErr(t, "   \n\n", patch.FormatAuto, "empty")
+}
+
+func TestAutoDetectIgnoresProseWithDiffLikeHeaders(t *testing.T) {
+	in := join(
+		"A documentação explica:",
+		"--- uma opção antiga",
+		"+++ uma opção nova",
+		"Isto é apenas um exemplo.",
+	)
+
+	expectErr(t, in, patch.FormatAuto, "No supported patch found")
+}
+
+func TestAutoDetectIgnoresMalformedDiffGitHeader(t *testing.T) {
+	in := join(
+		"Exemplo de documentação:",
+		"diff --git isto não é um diff válido",
+		"Apenas texto explicativo.",
+	)
+
+	expectErr(t, in, patch.FormatAuto, "No supported patch found")
 }
 
 func TestParseFormat(t *testing.T) {
