@@ -262,4 +262,4 @@ Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 
 ## License
 
-This repository does not currently contain a `LICENSE` file, so no open-source license has been granted. Until one is added, the default copyright rules apply (all rights reserved).
+Clip-Patch is licensed under the [MIT License](LICENSE).
