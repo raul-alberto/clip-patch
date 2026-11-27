@@ -64,20 +64,53 @@ func detect(lines []string) (hasSR, hasUD bool) {
 		if isSearchMarker(l) {
 			hasSR = true
 		}
-		if strings.HasPrefix(l, "diff --git ") {
+
+		// A plain unified diff needs file headers followed by a hunk.
+		if strings.HasPrefix(l, "--- ") &&
+			i+2 < len(lines) &&
+			strings.HasPrefix(lines[i+1], "+++ ") &&
+			strings.HasPrefix(lines[i+2], "@@ ") {
 			hasUD = true
 		}
-		if strings.HasPrefix(l, "--- ") && i+1 < len(lines) && strings.HasPrefix(lines[i+1], "+++ ") {
-			hasUD = true
+
+		// A Git diff needs supporting evidence after its header.
+		if strings.HasPrefix(l, "diff --git ") {
+			for j := i + 1; j < len(lines); j++ {
+				current := lines[j]
+
+				if strings.HasPrefix(current, "diff --git ") {
+					break
+				}
+
+				if strings.HasPrefix(current, "--- ") &&
+					j+1 < len(lines) &&
+					strings.HasPrefix(lines[j+1], "+++ ") {
+					hasUD = true
+					break
+				}
+
+				if current == "GIT binary patch" ||
+					strings.HasPrefix(current, "Binary files ") ||
+					strings.HasPrefix(current, "old mode ") ||
+					strings.HasPrefix(current, "new mode ") ||
+					strings.HasPrefix(current, "new file mode ") ||
+					strings.HasPrefix(current, "deleted file mode ") ||
+					strings.HasPrefix(current, "rename from ") ||
+					strings.HasPrefix(current, "copy from ") {
+					hasUD = true
+					break
+				}
+			}
 		}
 	}
+
 	return hasSR, hasUD
 }
 
 // ---------------------------------------------------------------------------
 // SEARCH / REPLACE
 
-var fileHeaderRe = regexp.MustCompile(`^\s*#{0,6}\s*FILE:\s*(.+?)\s*$`)
+var fileHeaderRe = regexp.MustCompile(`^\s*### FILE:\s*(.*?)\s*$`)
 
 func isSearchMarker(l string) bool  { return strings.TrimRight(l, " \t") == "<<<<<<< SEARCH" }
 func isDivider(l string) bool       { return strings.TrimRight(l, " \t") == "=======" }
@@ -113,6 +146,9 @@ func parseSearchReplace(lines []string) (*patch.Patch, error) {
 		case stProse:
 			if m := fileHeaderRe.FindStringSubmatch(raw); m != nil {
 				curFile = cleanPathToken(m[1])
+				if curFile == "" {
+					return nil, srError(fmt.Sprintf("line %d: FILE header has an empty path.", lineNo))
+				}
 				continue
 			}
 			if isSearchMarker(raw) {
@@ -269,8 +305,14 @@ func parseSection(lines []string, i int) (*patch.FilePatch, int, error) {
 			Reason: "expected '--- ' and '+++ ' header lines (the diff may be truncated, or contains only unsupported changes).",
 		}
 	}
-	oldP := headerPath(lines[i][4:])
-	newP := headerPath(lines[i+1][4:])
+	oldP, err := headerPath(lines[i][4:])
+	if err != nil {
+		return nil, 0, udError(fmt.Sprintf("invalid old file path: %v", err))
+	}
+	newP, err := headerPath(lines[i+1][4:])
+	if err != nil {
+		return nil, 0, udError(fmt.Sprintf("invalid new file path: %v", err))
+	}
 	i += 2
 
 	if oldP == "/dev/null" {
@@ -279,7 +321,18 @@ func parseSection(lines []string, i int) (*patch.FilePatch, int, error) {
 	if newP == "/dev/null" {
 		return nil, 0, unsupported(oldP, "deleting files is not supported")
 	}
-	if strings.HasPrefix(oldP, "a/") && strings.HasPrefix(newP, "b/") {
+	oldHasPrefix := strings.HasPrefix(oldP, "a/")
+	newHasPrefix := strings.HasPrefix(newP, "b/")
+
+	if oldHasPrefix != newHasPrefix {
+		return nil, 0, &patch.Error{
+			Title:  "Malformed or unsupported unified diff.",
+			File:   newP,
+			Reason: "inconsistent file path prefixes: expected both 'a/' and 'b/' prefixes, or neither.",
+		}
+	}
+
+	if oldHasPrefix {
 		oldP = strings.TrimPrefix(oldP, "a/")
 		newP = strings.TrimPrefix(newP, "b/")
 	}
@@ -331,15 +384,57 @@ func looksLikeDiffBody(lines []string, i int) bool {
 	return false
 }
 
-func headerPath(s string) string {
+func headerPath(s string) (string, error) {
 	if idx := strings.IndexByte(s, '\t'); idx >= 0 {
 		s = s[:idx]
 	}
 	s = strings.TrimSpace(s)
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		s = s[1 : len(s)-1]
+
+	if strings.ContainsRune(s, '"') && !strings.HasPrefix(s, `"`) {
+		return "", fmt.Errorf("invalid quoted path")
 	}
-	return s
+	if !strings.HasPrefix(s, `"`) {
+		return s, nil
+	}
+
+	if len(s) < 2 || s[len(s)-1] != '"' {
+		return "", fmt.Errorf("invalid quoted path")
+	}
+
+	for i := 1; i < len(s)-1; i++ {
+		if s[i] != '\\' {
+			continue
+		}
+
+		i++
+		if i >= len(s)-1 {
+			return "", fmt.Errorf("invalid quoted path escape")
+		}
+
+		switch s[i] {
+		case '"', '\\', 'a', 'b', 'f', 'n', 'r', 't', 'v':
+			continue
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			if i+2 >= len(s)-1 {
+				return "", fmt.Errorf("invalid octal path escape")
+			}
+			for j := 0; j < 2; j++ {
+				i++
+				if s[i] < '0' || s[i] > '7' {
+					return "", fmt.Errorf("invalid octal path escape")
+				}
+			}
+		default:
+			return "", fmt.Errorf("invalid quoted path escape")
+		}
+	}
+
+	path, err := strconv.Unquote(s)
+	if err != nil {
+		return "", fmt.Errorf("invalid quoted path: %w", err)
+	}
+
+	return path, nil
 }
 
 func parseHunk(lines []string, i int, file string) (*patch.Hunk, int, error) {

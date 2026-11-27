@@ -249,6 +249,72 @@ func TestBackupCreationFailureAborts(t *testing.T) {
 	}
 }
 
+func TestBackupPartialDirectoryIsRemoved(t *testing.T) {
+	root := newProject(t, map[string]string{"a.txt": "one\n"})
+	plan, err := BuildPlan(root, sr(map[string][2]string{
+		"a.txt": {"one", "1"},
+	}, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changes := plan.ChangedFiles()
+
+	// Force a failure after the session directory has been created.
+	changes[0].File.Rel = ".."
+
+	backups := filepath.Join(t.TempDir(), "backups")
+	ops := DefaultOps()
+	ops.NewID = func() string { return "partial-test" }
+
+	backupDir, err := createBackup(plan, changes, backups, ops)
+	if err == nil {
+		t.Fatal("expected backup creation to fail")
+	}
+	if backupDir != "" {
+		t.Errorf("expected no backup path after successful cleanup, got %q", backupDir)
+	}
+
+	partial := filepath.Join(backups, "partial-test")
+	if _, err := os.Stat(partial); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected partial backup directory to be removed, stat error: %v", err)
+	}
+}
+
+func TestBackupCleanupFailureReportsDirectory(t *testing.T) {
+	root := newProject(t, map[string]string{"a.txt": "one\n"})
+	plan, err := BuildPlan(root, sr(map[string][2]string{
+		"a.txt": {"one", "1"},
+	}, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changes := plan.ChangedFiles()
+	changes[0].File.Rel = ".."
+
+	backups := filepath.Join(t.TempDir(), "backups")
+	ops := DefaultOps()
+	ops.NewID = func() string { return "partial-test" }
+	ops.RemoveAll = func(path string) error {
+		return errors.New("injected: cleanup failed")
+	}
+
+	backupDir, err := createBackup(plan, changes, backups, ops)
+	if err == nil {
+		t.Fatal("expected backup creation to fail")
+	}
+	if backupDir == "" {
+		t.Fatal("expected incomplete backup directory to be reported")
+	}
+	if !strings.Contains(err.Error(), "cleanup failed") {
+		t.Errorf("expected cleanup failure in error, got %v", err)
+	}
+	if _, err := os.Stat(backupDir); err != nil {
+		t.Fatalf("expected incomplete backup directory to remain available: %v", err)
+	}
+}
+
 func TestTempFileFailureLeavesFilesUntouched(t *testing.T) {
 	root := newProject(t, map[string]string{"a.txt": "one\n", "b.txt": "two\n"})
 	plan, err := BuildPlan(root, sr(map[string][2]string{"a.txt": {"one", "1"}, "b.txt": {"two", "2"}}, "a.txt", "b.txt"))
@@ -279,6 +345,7 @@ func TestTempFileFailureLeavesFilesUntouched(t *testing.T) {
 }
 
 func TestRenameFailureRollsBack(t *testing.T) {
+
 	root := newProject(t, map[string]string{"a.txt": "one\n", "b.txt": "two\n"})
 	plan, err := BuildPlan(root, sr(map[string][2]string{"a.txt": {"one", "1"}, "b.txt": {"two", "2"}}, "a.txt", "b.txt"))
 	if err != nil {
@@ -305,6 +372,88 @@ func TestRenameFailureRollsBack(t *testing.T) {
 		t.Fatalf("rollback did not restore originals: a=%q b=%q", read(t, root, "a.txt"), read(t, root, "b.txt"))
 	}
 	noTempLeftovers(t, root)
+}
+
+func TestRollbackFailurePreservesBackup(t *testing.T) {
+	root := newProject(t, map[string]string{
+		"a.txt": "one\n",
+		"b.txt": "two\n",
+	})
+
+	plan, err := BuildPlan(root, sr(map[string][2]string{
+		"a.txt": {"one", "1"},
+		"b.txt": {"two", "2"},
+	}, "a.txt", "b.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ops := DefaultOps()
+	calls := 0
+	ops.Rename = func(oldpath, newpath string) error {
+		calls++
+
+		// A segunda substituição falha.
+		// A terceira chamada é o rollback e também falha.
+		if calls == 2 || calls == 3 {
+			return errors.New("injected: rename failed")
+		}
+
+		return os.Rename(oldpath, newpath)
+	}
+
+	_, err = Execute(plan, filepath.Join(t.TempDir(), "bk"), ops)
+
+	var xe *ExecError
+	if !errors.As(err, &xe) {
+		t.Fatalf("expected ExecError, got %v", err)
+	}
+
+	if !xe.Modified {
+		t.Errorf("expected Modified=true after rollback failure: %+v", xe)
+	}
+	if xe.RolledBack {
+		t.Errorf("expected RolledBack=false after rollback failure: %+v", xe)
+	}
+
+	// O primeiro ficheiro continua modificado porque o rollback falhou.
+	if got := read(t, root, "a.txt"); got != "1\n" {
+		t.Errorf("expected a.txt to remain modified, got %q", got)
+	}
+
+	// O segundo ficheiro não chegou a ser substituído.
+	if got := read(t, root, "b.txt"); got != "two\n" {
+		t.Errorf("expected b.txt to remain original, got %q", got)
+	}
+
+	// A cópia de segurança tem de continuar disponível.
+	if xe.BackupDir == "" {
+		t.Fatal("expected BackupDir to be reported")
+	}
+	if _, err := os.Stat(xe.BackupDir); err != nil {
+		t.Fatalf("backup directory is unavailable: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(xe.BackupDir, "manifest.json")); err != nil {
+		t.Fatalf("backup manifest is unavailable: %v", err)
+	}
+
+	// Confirmar que os backups contêm os bytes originais.
+	backupA := filepath.Join(xe.BackupDir, "files", "a.txt")
+	backupB := filepath.Join(xe.BackupDir, "files", "b.txt")
+
+	if got, err := os.ReadFile(backupA); err != nil {
+		t.Fatalf("cannot read backup of a.txt: %v", err)
+	} else if string(got) != "one\n" {
+		t.Errorf("backup of a.txt is incorrect: %q", string(got))
+	}
+
+	if got, err := os.ReadFile(backupB); err != nil {
+		t.Fatalf("cannot read backup of b.txt: %v", err)
+	} else if string(got) != "two\n" {
+		t.Errorf("backup of b.txt is incorrect: %q", string(got))
+	}
+
 }
 
 func TestNoOpPatchWritesNothing(t *testing.T) {
@@ -357,5 +506,40 @@ func TestDefaultBackupDirIsAbsolute(t *testing.T) {
 	}
 	if want := filepath.Join(data, "clip-patch", "backups"); got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestVerifyUnchangedRejectsSymlinkReplacement(t *testing.T) {
+	root := newProject(t, map[string]string{
+		"target.txt": "original content\n",
+	})
+
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := sr(map[string][2]string{
+		"target.txt": {"original content", "modified content"},
+	}, "target.txt")
+
+	plan, err := BuildPlan(root, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(root, "target.txt")
+
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Symlink(outside, target); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	err = plan.VerifyUnchanged()
+	if err == nil {
+		t.Fatal("expected VerifyUnchanged to reject symlink replacement")
 	}
 }

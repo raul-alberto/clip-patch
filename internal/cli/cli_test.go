@@ -12,15 +12,44 @@ import (
 	"clip-patch/internal/clipboard"
 )
 
+type errorReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+type failWriter struct {
+	bytes.Buffer
+	marker []byte
+	err    error
+}
+
+func (w *failWriter) Write(p []byte) (int, error) {
+	if len(w.marker) == 0 || bytes.Contains(p, w.marker) {
+		return 0, w.err
+	}
+	return w.Buffer.Write(p)
+}
+
+func (r *errorReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, r.err
+	}
+	r.done = true
+	n := copy(p, r.data)
+	return n, r.err
+}
+
 type harness struct {
-	t       *testing.T
-	root    string
-	backups string
-	clip    string
-	clipErr error
-	stdin   string
-	tty     bool   // whether a terminal is available for the prompt
-	answer  string // what the user types at the prompt
+	t         *testing.T
+	root      string
+	backups   string
+	clip      string
+	clipErr   error
+	stdin     string
+	tty       bool   // whether a terminal is available for the prompt
+	answer    string // what the user types at the prompt
+	answerErr error
 }
 
 func newHarness(t *testing.T, files map[string]string) *harness {
@@ -40,12 +69,17 @@ func newHarness(t *testing.T, files map[string]string) *harness {
 
 func (h *harness) run(args ...string) (code int, stdout, stderr string) {
 	var out, errb bytes.Buffer
+	code = Run(args, h.environment(&out, &errb))
+	return code, out.String(), errb.String()
+}
+
+func (h *harness) environment(stdout, stderr io.Writer) Env {
 	env := Env{
 		Name:      "clip-patch",
 		Version:   "0.1.0",
 		Stdin:     strings.NewReader(h.stdin),
-		Stdout:    &out,
-		Stderr:    &errb,
+		Stdout:    stdout,
+		Stderr:    stderr,
 		Clipboard: clipboard.Static{Text: h.clip, Err: h.clipErr},
 		Getwd:     func() (string, error) { return h.root, nil },
 		DefaultBackupDir: func() (string, error) {
@@ -55,11 +89,16 @@ func (h *harness) run(args ...string) (code int, stdout, stderr string) {
 	if h.tty {
 		answer := h.answer
 		env.Interactive = func() (io.ReadCloser, error) {
+			if h.answerErr != nil {
+				return io.NopCloser(&errorReader{
+					data: []byte(answer),
+					err:  h.answerErr,
+				}), nil
+			}
 			return io.NopCloser(strings.NewReader(answer)), nil
 		}
 	}
-	code = Run(args, env)
-	return code, out.String(), errb.String()
+	return env
 }
 
 func (h *harness) file(rel string) string {
@@ -164,6 +203,34 @@ func TestStdinDryRun(t *testing.T) {
 	}
 }
 
+func TestStdinRejectsInvalidUTF8BeforePlanning(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "hello\nworld\n"})
+	h.stdin = srText("a.txt", "world", "there\xff")
+
+	code, _, errOut := h.run("--stdin", "--yes")
+	if code != ExitError {
+		t.Fatalf("exit %d, want %d", code, ExitError)
+	}
+	contains(t, "stderr", errOut, "standard input is not valid UTF-8", "No files were modified")
+	if got := h.file("a.txt"); got != "hello\nworld\n" {
+		t.Fatalf("file changed after invalid UTF-8 input: %q", got)
+	}
+	if h.backupsCreated() {
+		t.Fatal("backup created after invalid UTF-8 input")
+	}
+}
+
+func TestStdinInputLimit(t *testing.T) {
+	h := newHarness(t, nil)
+	h.stdin = strings.Repeat("x", MaxInputSize+1)
+
+	code, _, errOut := h.run("--stdin")
+	if code != ExitError {
+		t.Fatalf("exit %d, want %d", code, ExitError)
+	}
+	contains(t, "stderr", errOut, "larger than 8 MiB", "No files were modified")
+}
+
 func TestDryRunNeedsNoTerminal(t *testing.T) {
 	h := newHarness(t, map[string]string{"a.txt": "x\n"})
 	h.clip = srText("a.txt", "x", "y")
@@ -174,7 +241,7 @@ func TestDryRunNeedsNoTerminal(t *testing.T) {
 }
 
 func TestInteractiveApproval(t *testing.T) {
-	for _, answer := range []string{"y\n", "Y\n", "yes\n", "  YES  \n"} {
+	for _, answer := range []string{"y\n", "y", "Y\n", "yes\n", "  YES  \n"} {
 		h := newHarness(t, map[string]string{"a.txt": "hello\nworld\n"})
 		h.clip = srText("a.txt", "world", "there")
 		h.tty = true
@@ -190,6 +257,95 @@ func TestInteractiveApproval(t *testing.T) {
 		if !h.backupsCreated() {
 			t.Fatalf("answer %q: no backup created", answer)
 		}
+	}
+}
+
+func TestInteractiveReadErrorIsReportedAndRejects(t *testing.T) {
+	for _, answer := range []string{"", "y"} {
+		t.Run(answer, func(t *testing.T) {
+			h := newHarness(t, map[string]string{"a.txt": "hello\nworld\n"})
+			h.clip = srText("a.txt", "world", "there")
+			h.tty = true
+			h.answer = answer
+			h.answerErr = errors.New("injected read error")
+
+			code, _, errOut := h.run()
+			if code != ExitError {
+				t.Fatalf("exit %d, want %d; stderr %q", code, ExitError, errOut)
+			}
+			contains(t, "stderr", errOut, "cannot ask for confirmation", "injected read error")
+
+			if got := h.file("a.txt"); got != "hello\nworld\n" {
+				t.Fatalf("file modified after read error: %q", got)
+			}
+			if h.backupsCreated() {
+				t.Fatal("backup created after read error")
+			}
+		})
+	}
+}
+
+func TestInteractiveConfirmationInputIsBounded(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "hello\nworld\n"})
+	h.clip = srText("a.txt", "world", "there")
+	h.tty = true
+	h.answer = strings.Repeat("x", maxConfirmationBytes+1) + "\ny\n"
+
+	code, _, errOut := h.run()
+	if code != ExitError {
+		t.Fatalf("exit %d, want %d", code, ExitError)
+	}
+	contains(t, "stderr", errOut, "confirmation response exceeds", "No files were modified")
+	if got := h.file("a.txt"); got != "hello\nworld\n" {
+		t.Fatalf("file changed after oversized confirmation: %q", got)
+	}
+	if h.backupsCreated() {
+		t.Fatal("backup created after oversized confirmation")
+	}
+}
+
+func TestPreviewWriteFailureAbortsBeforeApply(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "hello\nworld\n"})
+	h.stdin = srText("a.txt", "world", "there")
+
+	var stderr bytes.Buffer
+	stdout := &failWriter{err: errors.New("injected preview write failure")}
+	code := Run([]string{"--stdin", "--yes"}, h.environment(stdout, &stderr))
+
+	if code != ExitError {
+		t.Fatalf("exit %d, want %d", code, ExitError)
+	}
+	contains(t, "stderr", stderr.String(), "cannot write preview", "injected preview write failure")
+	if got := h.file("a.txt"); got != "hello\nworld\n" {
+		t.Fatalf("file changed after preview write failure: %q", got)
+	}
+	if h.backupsCreated() {
+		t.Fatal("backup created after preview write failure")
+	}
+}
+
+func TestPromptWriteFailureAbortsBeforeApply(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "hello\nworld\n"})
+	h.clip = srText("a.txt", "world", "there")
+	h.tty = true
+	h.answer = "y\n"
+
+	var stderr bytes.Buffer
+	stdout := &failWriter{
+		marker: []byte("Apply these changes?"),
+		err:    errors.New("injected prompt write failure"),
+	}
+	code := Run(nil, h.environment(stdout, &stderr))
+
+	if code != ExitError {
+		t.Fatalf("exit %d, want %d", code, ExitError)
+	}
+	contains(t, "stderr", stderr.String(), "cannot ask for confirmation", "injected prompt write failure")
+	if got := h.file("a.txt"); got != "hello\nworld\n" {
+		t.Fatalf("file changed after prompt write failure: %q", got)
+	}
+	if h.backupsCreated() {
+		t.Fatal("backup created after prompt write failure")
 	}
 }
 

@@ -186,7 +186,7 @@ These are rejected explicitly and nothing is modified: creating, deleting, renam
 | **File checks** | Only existing, regular, writable UTF-8 text files up to 32 MiB are modified. Binary files, UTF-16, invalid UTF-8, bare-CR and mixed line endings are rejected. |
 | **Exact matching** | No fuzzy matching. Missing or ambiguous context aborts the whole patch, with no partial application. |
 | **Preview** | Every change is shown as a diff before anything is written. |
-| **Fingerprint check** | At the start of the apply step, before backups are created and before any temporary file is staged, each target's SHA-256 is compared with the value taken for the preview. A file that changed since the preview aborts the run. |
+| **Fingerprint check** | Each target's SHA-256 is checked against the value captured during preview. Targets are revalidated before staging and immediately before replacement. Changes detected during these checks abort the operation. A residual time-of-check/time-of-use window remains. |
 | **Verified backups** | Original bytes are copied, then read back and compared, before any file is changed. |
 | **Writes** | New content is staged in temporary files in the target directories, then renamed over the originals and verified after writing. If a later step fails, rollback from the in-memory originals is attempted; rollback itself can fail, so restoration is not guaranteed. |
 | **Local only** | No network code. Clipboard text is parsed as data and never executed. |
@@ -206,7 +206,7 @@ Use `--backup-dir PATH` to choose another location. To undo a change, copy the f
 > [!WARNING]
 > **Known limitations of the safety model**
 > - Replacing several files is **not globally atomic**. If a step fails after earlier files were replaced, Clip-Patch attempts to restore them, but that rollback can itself fail, and a crash or power loss during the rename phase can leave partial changes. The backup directory is your recovery path.
-> - A time-of-check/time-of-use window exists between the fingerprint check at the start of the apply step and the later renames.
+> - Revalidation before staging and replacement reduces the time-of-check/time-of-use window, but cannot eliminate it. A directory or file can still change between validation and the filesystem operation.
 > - There is **no dedicated restore command** yet, and a complete restore workflow has not been tested.
 > - Clip-Patch protects against honest mistakes and hostile patch text. It is not a defence against a hostile process already running as you.
 

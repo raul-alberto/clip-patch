@@ -38,6 +38,41 @@ type command struct {
 	args []string
 }
 
+var errClipboardOutputTooLarge = errors.New("clipboard command output exceeds the configured limit")
+
+const (
+	maxClipboardBytes     = 8 << 20
+	maxStderrBytes        = 64 << 10
+	defaultCommandTimeout = 5 * time.Second
+)
+
+type limitedBuffer struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	remaining := b.limit - b.buffer.Len()
+
+	if remaining <= 0 {
+		b.exceeded = true
+		return len(p), nil
+	}
+
+	if len(p) > remaining {
+		b.exceeded = true
+		_, _ = b.buffer.Write(p[:remaining])
+		return len(p), nil
+	}
+
+	return b.buffer.Write(p)
+}
+
+func (b *limitedBuffer) Bytes() []byte {
+	return b.buffer.Bytes()
+}
+
 // System reads the real clipboard. Its fields exist so tests can substitute
 // the environment; use NewSystem for production.
 type System struct {
@@ -55,22 +90,52 @@ func NewSystem() *System {
 		Getenv:   os.Getenv,
 		LookPath: exec.LookPath,
 		Run:      runCommand,
-		Timeout:  5 * time.Second,
+		Timeout:  defaultCommandTimeout,
 	}
 }
 
 func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	var stdout, stderr bytes.Buffer
+
+	var stdout limitedBuffer
+	stdout.limit = maxClipboardBytes
+
+	var stderr limitedBuffer
+	stderr.limit = maxStderrBytes
+
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
+
+	err := cmd.Run()
+
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+	}
+
+	if stdout.exceeded {
+		return nil, fmt.Errorf(
+			"%w: %d bytes",
+			errClipboardOutputTooLarge,
+			maxClipboardBytes,
+		)
+	}
+
+	if err != nil {
+		msg := strings.TrimSpace(string(stderr.Bytes()))
+
+		if stderr.exceeded {
+			msg += " (stderr truncated)"
+		}
+
 		if msg != "" {
 			return nil, fmt.Errorf("%w: %s", err, msg)
 		}
+
 		return nil, err
 	}
+
 	return stdout.Bytes(), nil
 }
 
@@ -128,12 +193,32 @@ func (s *System) ReadText() (string, error) {
 
 	var lastErr error
 	for _, c := range available {
-		ctx, cancel := context.WithTimeout(context.Background(), s.Timeout)
+		timeout := s.Timeout
+		if timeout <= 0 {
+			timeout = defaultCommandTimeout
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		out, err := s.Run(ctx, c.name, c.args...)
 		cancel()
 		if err != nil {
-			lastErr = fmt.Errorf("%s failed: %w", c.name, err)
+			wrappedErr := fmt.Errorf("%s failed: %w", c.name, err)
+
+			if errors.Is(err, context.DeadlineExceeded) ||
+				errors.Is(err, context.Canceled) ||
+				errors.Is(err, errClipboardOutputTooLarge) {
+				return "", wrappedErr
+			}
+
+			lastErr = wrappedErr
 			continue
+		}
+		if len(out) > maxClipboardBytes {
+			return "", fmt.Errorf(
+				"%s returned clipboard data exceeding the %d-byte limit",
+				c.name,
+				maxClipboardBytes,
+			)
 		}
 		if !utf8.Valid(out) {
 			return "", fmt.Errorf("%s returned data that is not valid UTF-8 text", c.name)
