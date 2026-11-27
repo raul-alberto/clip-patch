@@ -2,9 +2,10 @@
 
 **Copy an AI-generated patch, run `cpatch`, review the diff, apply it safely.**
 
-> **Status: pre-release (0.1.0 MVP).** Not yet published. The code has not yet been
-> compiled or tested by its author at the time of writing; see
-> [docs/VERIFICATION.md](docs/VERIFICATION.md) for exactly what has and has not been verified.
+> **Status: pre-release (0.1.0 MVP).** The project has been compiled,
+> tested, and manually verified. GitHub Actions passes on Windows, Linux, and macOS.
+>
+> See [docs/VERIFICATION.md](docs/VERIFICATION.md) for verification details and remaining limitations.
 
 AI assistants often return code changes as partial blocks or diffs. Pasting them
 by hand risks wrong indentation, edits in the wrong place, and damaged code.
@@ -169,9 +170,11 @@ deleted automatically. To undo, copy the files back.
 
 ## Supported operating systems
 
-Written for Windows 10/11, Linux (X11 and Wayland) and macOS. A GitHub Actions workflow
-that runs the tests on all three is included. **Until that workflow and the manual checks have
-actually been run, none of these platforms should be considered verified.**
+The project targets **Windows 10/11**, **Linux (X11 and Wayland)**, and **macOS**.
+
+The automated CI pipeline successfully runs tests, formatting checks, vet, and builds on **Windows**, **Linux**, and **macOS**. Manual QA has also been completed on **Windows**.
+
+Platform-specific clipboard behaviour and other environment-dependent interactions have not yet been manually verified on every operating system.
 
 ## Known limitations
 
