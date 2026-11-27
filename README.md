@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="Clip-Patch logo" width="140">
+<img src="assets/logo.png" alt="Clip-Patch logo" width="250">
 
 # Clip-Patch
 
